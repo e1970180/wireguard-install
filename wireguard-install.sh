@@ -27,8 +27,14 @@ check_pvt_ip() {
 }
 
 check_dns_name() {
-	FQDN_REGEX='^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
-	printf '%s' "$1" | tr -d '\n' | grep -Eq "$FQDN_REGEX"
+        FQDN_REGEX='^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
+        printf '%s' "$1" | tr -d '\n' | grep -Eq "$FQDN_REGEX"
+}
+
+check_subnet() {
+        IFS=/ read -r net prefix <<< "$1"
+        check_ip "$net" || return 1
+        [ "$prefix" = "24" ] || return 1
 }
 
 check_root() {
@@ -153,13 +159,18 @@ parse_args() {
 				shift
 				shift
 				;;
-			--dns2)
-				dns2="$2"
-				shift
-				shift
-				;;
-			-y|--yes)
-				assume_yes=1
+                        --dns2)
+                                dns2="$2"
+                                shift
+                                shift
+                                ;;
+                        --subnet)
+                                vpn_subnet="$2"
+                                shift
+                                shift
+                                ;;
+                        -y|--yes)
+                                assume_yes=1
 				shift
 				;;
 			-h|--help)
@@ -195,13 +206,13 @@ check_args() {
 	if [ "$((add_client + remove_client + show_client_qr))" = 1 ] && [ -n "$first_client_name" ]; then
 		show_usage "Invalid parameters. '--clientname' can only be specified when installing WireGuard."
 	fi
-	if [ -n "$server_addr" ] || [ -n "$server_port" ] || [ -n "$first_client_name" ]; then
-			if [ -e "$WG_CONF" ]; then
-				show_usage "Invalid parameters. WireGuard is already set up on this server."
-			elif [ "$auto" = 0 ]; then
-				show_usage "Invalid parameters. You must specify '--auto' when using these parameters."
-			fi
-	fi
+       if [ -n "$server_addr" ] || [ -n "$server_port" ] || [ -n "$first_client_name" ] || [ -n "$vpn_subnet" ]; then
+                       if [ -e "$WG_CONF" ]; then
+                               show_usage "Invalid parameters. WireGuard is already set up on this server."
+                       elif [ "$auto" = 0 ]; then
+                               show_usage "Invalid parameters. You must specify '--auto' when using these parameters."
+                       fi
+       fi
 	if [ "$add_client" = 1 ]; then
 		set_client_name
 		if [ -z "$client" ]; then
@@ -226,16 +237,21 @@ check_args() {
 			exiterr "Invalid client name. Use one word only, no special characters except '-' and '_'."
 		fi
 	fi
-	if [ -n "$server_port" ]; then
-		if [[ ! "$server_port" =~ ^[0-9]+$ || "$server_port" -gt 65535 ]]; then
-			exiterr "Invalid port. Must be an integer between 1 and 65535."
-		fi
-	fi
-	if [ -n "$dns1" ]; then
-		if [ -e "$WG_CONF" ] && [ "$add_client" = 0 ]; then
-			show_usage "Invalid parameters. Custom DNS server(s) can only be specified when installing WireGuard or adding a client."
-		fi
-	fi
+       if [ -n "$server_port" ]; then
+               if [[ ! "$server_port" =~ ^[0-9]+$ || "$server_port" -gt 65535 ]]; then
+                       exiterr "Invalid port. Must be an integer between 1 and 65535."
+               fi
+       fi
+       if [ -n "$vpn_subnet" ]; then
+               if ! check_subnet "$vpn_subnet"; then
+                       exiterr "Invalid subnet. Must be an IPv4 /24 network."
+               fi
+       fi
+       if [ -n "$dns1" ]; then
+               if [ -e "$WG_CONF" ] && [ "$add_client" = 0 ]; then
+                       show_usage "Invalid parameters. Custom DNS server(s) can only be specified when installing WireGuard or adding a client."
+               fi
+       fi
 	if { [ -n "$dns1" ] && ! check_ip "$dns1"; } \
 		|| { [ -n "$dns2" ] && ! check_ip "$dns2"; }; then
 		exiterr "Invalid DNS server(s)."
@@ -359,10 +375,11 @@ Install options (optional):
   --clientname [client name]     name for the first WireGuard client (default: client)
   --dns1 [DNS server IP]         primary DNS server for first client (default: Google Public DNS)
   --dns2 [DNS server IP]         secondary DNS server for first client
+  --subnet [IPv4 subnet]         internal VPN subnet in CIDR (default: 10.7.0.0/24)
 
 To customize options, you may also run this script without arguments.
 EOF
-	exit 1
+        exit 1
 }
 
 show_welcome() {
@@ -373,10 +390,10 @@ show_welcome() {
 	else
 		show_header
 		op_text=default
-		if [ -n "$server_addr" ] || [ -n "$server_port" ] \
-			|| [ -n "$first_client_name" ] || [ -n "$dns1" ]; then
-			op_text=custom
-		fi
+               if [ -n "$server_addr" ] || [ -n "$server_port" ] \
+                       || [ -n "$first_client_name" ] || [ -n "$dns1" ] || [ -n "$vpn_subnet" ]; then
+                       op_text=custom
+               fi
 		echo
 		echo "Starting WireGuard setup using $op_text options."
 	fi
@@ -725,7 +742,7 @@ create_server_config() {
 # ENDPOINT $([[ -n "$public_ip" ]] && echo "$public_ip" || echo "$ip")
 
 [Interface]
-Address = 10.7.0.1/24$([[ -n "$ip6" ]] && echo ", fddd:2c4:2c4:2c4::1/64")
+Address = ${subnet_base}.1/${subnet_prefix}$([[ -n "$ip6" ]] && echo ", fddd:2c4:2c4:2c4::1/64")
 PrivateKey = $(wg genkey)
 ListenPort = $port
 
@@ -737,12 +754,12 @@ create_firewall_rules() {
 	if systemctl is-active --quiet firewalld.service; then
 		# Using both permanent and not permanent rules to avoid a firewalld reload
 		firewall-cmd -q --add-port="$port"/udp
-		firewall-cmd -q --zone=trusted --add-source=10.7.0.0/24
+               firewall-cmd -q --zone=trusted --add-source=$vpn_subnet
 		firewall-cmd -q --permanent --add-port="$port"/udp
-		firewall-cmd -q --permanent --zone=trusted --add-source=10.7.0.0/24
+               firewall-cmd -q --permanent --zone=trusted --add-source=$vpn_subnet
 		# Set NAT for the VPN subnet
-		firewall-cmd -q --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE
-		firewall-cmd -q --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE
+               firewall-cmd -q --direct --add-rule ipv4 nat POSTROUTING 0 -s $vpn_subnet ! -d $vpn_subnet -j MASQUERADE
+               firewall-cmd -q --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s $vpn_subnet ! -d $vpn_subnet -j MASQUERADE
 		if [[ -n "$ip6" ]]; then
 			firewall-cmd -q --zone=trusted --add-source=fddd:2c4:2c4:2c4::/64
 			firewall-cmd -q --permanent --zone=trusted --add-source=fddd:2c4:2c4:2c4::/64
@@ -764,13 +781,13 @@ After=network-online.target
 Wants=network-online.target
 [Service]
 Type=oneshot
-ExecStart=$iptables_path -w 5 -t nat -A POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE
+ExecStart=$iptables_path -w 5 -t nat -A POSTROUTING -s $vpn_subnet ! -d $vpn_subnet -j MASQUERADE
 ExecStart=$iptables_path -w 5 -I INPUT -p udp --dport $port -j ACCEPT
-ExecStart=$iptables_path -w 5 -I FORWARD -s 10.7.0.0/24 -j ACCEPT
+ExecStart=$iptables_path -w 5 -I FORWARD -s $vpn_subnet -j ACCEPT
 ExecStart=$iptables_path -w 5 -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-ExecStop=$iptables_path -w 5 -t nat -D POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE
+ExecStop=$iptables_path -w 5 -t nat -D POSTROUTING -s $vpn_subnet ! -d $vpn_subnet -j MASQUERADE
 ExecStop=$iptables_path -w 5 -D INPUT -p udp --dport $port -j ACCEPT
-ExecStop=$iptables_path -w 5 -D FORWARD -s 10.7.0.0/24 -j ACCEPT
+ExecStop=$iptables_path -w 5 -D FORWARD -s $vpn_subnet -j ACCEPT
 ExecStop=$iptables_path -w 5 -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" > /etc/systemd/system/wg-iptables.service
 		if [[ -n "$ip6" ]]; then
 			echo "ExecStart=$ip6tables_path -w 5 -t nat -A POSTROUTING -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j MASQUERADE
@@ -793,14 +810,14 @@ WantedBy=multi-user.target" >> /etc/systemd/system/wg-iptables.service
 remove_firewall_rules() {
 	port=$(grep '^ListenPort' "$WG_CONF" | cut -d " " -f 3)
 	if systemctl is-active --quiet firewalld.service; then
-		ip=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep '\-s 10.7.0.0/24 '"'"'!'"'"' -d 10.7.0.0/24' | grep -oE '[^ ]+$')
+               ip=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep "\-s $vpn_subnet_escaped '!' -d $vpn_subnet_escaped" | grep -oE '[^ ]+$')
 		# Using both permanent and not permanent rules to avoid a firewalld reload.
 		firewall-cmd -q --remove-port="$port"/udp
-		firewall-cmd -q --zone=trusted --remove-source=10.7.0.0/24
+		firewall-cmd -q --zone=trusted --remove-source=$vpn_subnet
 		firewall-cmd -q --permanent --remove-port="$port"/udp
-		firewall-cmd -q --permanent --zone=trusted --remove-source=10.7.0.0/24
-		firewall-cmd -q --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE
-		firewall-cmd -q --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE
+		firewall-cmd -q --permanent --zone=trusted --remove-source=$vpn_subnet
+		firewall-cmd -q --direct --remove-rule ipv4 nat POSTROUTING 0 -s $vpn_subnet ! -d $vpn_subnet -j MASQUERADE
+		firewall-cmd -q --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s $vpn_subnet ! -d $vpn_subnet -j MASQUERADE
 		if grep -qs 'fddd:2c4:2c4:2c4::1/64' "$WG_CONF"; then
 			ip6=$(firewall-cmd --direct --get-rules ipv6 nat POSTROUTING | grep '\-s fddd:2c4:2c4:2c4::/64 '"'"'!'"'"' -d fddd:2c4:2c4:2c4::/64' | grep -oE '[^ ]+$')
 			firewall-cmd -q --zone=trusted --remove-source=fddd:2c4:2c4:2c4::/64
@@ -908,21 +925,21 @@ new_client() {
 			read -rp "Do you want to specify an internal IP address for the new client? [y/N]: " specify_ip
 		done
 		if [[ ! "$specify_ip" =~ ^[yY]$ ]]; then
-			echo "Using auto assigned IP address 10.7.0.$octet."
+                       echo "Using auto assigned IP address ${subnet_base}.$octet."
 		fi
 	fi
 	if [[ "$specify_ip" =~ ^[yY]$ ]]; then
 		echo
-		read -rp "Enter IP address for the new client (e.g. 10.7.0.X): " client_ip
+               read -rp "Enter IP address for the new client (e.g. ${subnet_base}.X): " client_ip
 		octet=$(printf '%s' "$client_ip" | cut -d "." -f 4)
-		until [[ $client_ip =~ ^10\.7\.0\.([2-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-4])$ ]] \
-			&& ! grep AllowedIPs "$WG_CONF" | cut -d "." -f 4 | cut -d "/" -f 1 | grep -q "^$octet$"; do
-			if [[ ! $client_ip =~ ^10\.7\.0\.([2-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-4])$ ]]; then
-				echo "Invalid IP address. Must be within the range 10.7.0.2 to 10.7.0.254."
+               until [[ $client_ip =~ ^${subnet_escaped}\.([2-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-4])$ ]] \
+                        && ! grep AllowedIPs "$WG_CONF" | cut -d "." -f 4 | cut -d "/" -f 1 | grep -q "^$octet$"; do
+                        if [[ ! $client_ip =~ ^${subnet_escaped}\.([2-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-4])$ ]]; then
+                                echo "Invalid IP address. Must be within the range ${subnet_base}.2 to ${subnet_base}.254."
 			else
 				echo "The IP address is already in use. Please choose another one."
 			fi
-			read -rp "Enter IP address for the new client (e.g. 10.7.0.X): " client_ip
+                        read -rp "Enter IP address for the new client (e.g. ${subnet_base}.X): " client_ip
 			octet=$(printf '%s' "$client_ip" | cut -d "." -f 4)
 		done
 	fi
@@ -934,14 +951,14 @@ new_client() {
 [Peer]
 PublicKey = $(wg pubkey <<< "$key")
 PresharedKey = $psk
-AllowedIPs = 10.7.0.$octet/32$(grep -q 'fddd:2c4:2c4:2c4::1' "$WG_CONF" && echo ", fddd:2c4:2c4:2c4::$octet/128")
+AllowedIPs = ${subnet_base}.$octet/32$(grep -q 'fddd:2c4:2c4:2c4::1' "$WG_CONF" && echo ", fddd:2c4:2c4:2c4::$octet/128")
 # END_PEER $client
 EOF
 	# Create client configuration
 	get_export_dir
 	cat << EOF > "$export_dir$client".conf
 [Interface]
-Address = 10.7.0.$octet/24$(grep -q 'fddd:2c4:2c4:2c4::1' "$WG_CONF" && echo ", fddd:2c4:2c4:2c4::$octet/64")
+Address = ${subnet_base}.$octet/${subnet_prefix}$(grep -q 'fddd:2c4:2c4:2c4::1' "$WG_CONF" && echo ", fddd:2c4:2c4:2c4::$octet/64")
 DNS = $dns
 PrivateKey = $key
 
@@ -1261,9 +1278,17 @@ client=""
 dns=""
 dns1=""
 dns2=""
+vpn_subnet=""
 
 parse_args "$@"
 check_args
+
+[ -z "$vpn_subnet" ] && vpn_subnet="10.7.0.0/24"
+subnet_prefix=$(printf '%s' "$vpn_subnet" | cut -d/ -f2)
+subnet_network=$(printf '%s' "$vpn_subnet" | cut -d/ -f1)
+subnet_base=$(printf '%s' "$subnet_network" | cut -d '.' -f1-3)
+subnet_escaped=$(printf '%s' "$subnet_base" | sed 's/\./\\./g')
+vpn_subnet_escaped=$(printf '%s' "$vpn_subnet" | sed 's/\./\\./g')
 
 if [ "$add_client" = 1 ]; then
 	show_header
